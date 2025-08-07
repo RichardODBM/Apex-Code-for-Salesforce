@@ -1,0 +1,333 @@
+public with sharing class PathwrightActivityFetcher {
+    
+    // Flow-friendly wrapper class with all the fields you need
+    public class FlowActivity {
+        @InvocableVariable(label='Action Date/Time')   
+        public String actionDateTime;
+        
+        @InvocableVariable(label='Action')             
+        public String action;
+        
+        @InvocableVariable(label='Resource Name')      
+        public String resourceName;
+        
+        @InvocableVariable(label='Resource ID')        
+        public String resourceId;
+        
+        @InvocableVariable(label='Group Name')         
+        public String groupName;
+        
+        @InvocableVariable(label='Group ID')           
+        public String groupId;
+        
+        @InvocableVariable(label='User Email')         
+        public String userEmail;
+        
+        @InvocableVariable(label='User Full Name')     
+        public String userFullName;
+        
+        @InvocableVariable(label='User ID')            
+        public String userId;
+        
+        @InvocableVariable(label='Is Staff')           
+        public Boolean isStaff;
+        
+        @InvocableVariable(label='Registration ID')    
+        public String registrationId;
+        
+        @InvocableVariable(label='Path ID')            
+        public String pathId;
+        
+        @InvocableVariable(label='Completion State')   
+        public String completionState;
+        
+        @InvocableVariable(label='Payment Amount')     
+        public Decimal paymentAmount;
+        
+        @InvocableVariable(label='Coupon Code')        
+        public String couponCode;
+        
+        @InvocableVariable(label='Step Name')          
+        public String stepName;
+        
+        @InvocableVariable(label='Step URL')           
+        public String stepUrl;
+        
+        @InvocableVariable(label='Needs Grading')      
+        public Boolean needsGrading;
+    }
+    
+    // Input wrapper for Flow parameters
+    public class FlowInput {
+        @InvocableVariable(label='Page Size' description='Number of activities to fetch (default: 25)')
+        public Integer pageSize;
+        
+        @InvocableVariable(label='API Token' description='Pathwright API Token (optional if using Named Credential)')
+        public String apiToken;
+        
+        @InvocableVariable(label='School ID' description='Pathwright School ID (optional)')
+        public String schoolId;
+    }
+    
+    // Main invocable method for Flow
+    @InvocableMethod(
+        label='Fetch Pathwright Activities' 
+        description='Fetches activities from Pathwright GraphQL API and returns them for Flow processing'
+        category='Pathwright'
+    )
+    public static List<FlowActivity> getActivitiesForFlow(List<FlowInput> inputs) {
+        List<FlowActivity> results = new List<FlowActivity>();
+        
+        // Handle input parameters
+        FlowInput input = (inputs != null && !inputs.isEmpty()) ? inputs[0] : new FlowInput();
+        Integer pageSize = input.pageSize != null ? input.pageSize : 25;
+        String apiToken = input.apiToken;
+        String schoolId = input.schoolId;
+        
+        try {
+            List<FlowActivity> activities = fetchAndWrap(pageSize, apiToken, schoolId);
+            // Flatten into our single results list
+            results.addAll(activities);
+            System.debug('Successfully fetched ' + activities.size() + ' activities for Flow');
+        } catch (Exception e) {
+            System.debug(LoggingLevel.ERROR, 'Error in getActivitiesForFlow: ' + e.getMessage());
+            // leave results empty rather than adding an empty sub-list
+        }
+        
+        return results;
+    }
+    
+    // Internal method to fetch and wrap activities
+    private static List<FlowActivity> fetchAndWrap(Integer recordCount, String apiToken, String schoolId) {
+        HttpRequest req = new HttpRequest();
+        req.setMethod('POST');
+        req.setHeader('Content-Type', 'application/json');
+        
+        // Always point at your Named Credential by default
+        req.setEndpoint('callout:Pathwright_GraphQL');
+
+        // If the Flow passed in an explicit token, just add headers (don’t reset the endpoint)
+        if (String.isNotBlank(apiToken)) {
+            // (You can still use the Named Credential endpoint – no need to hard-code the URL)
+            req.setHeader('Authorization', apiToken);
+            if (String.isNotBlank(schoolId)) {
+                req.setHeader('X-School-Id', schoolId);
+            }
+        }
+        
+        // Prepare GraphQL payload
+        String gqlQuery = buildActivityQuery();
+        Map<String, Object> payload = new Map<String, Object>{
+            'query' => gqlQuery,
+            'variables' => new Map<String, Object>{ 'first' => recordCount }
+        };
+        req.setBody(JSON.serialize(payload));
+        
+        // Debug logging
+        System.debug('Fetching ' + recordCount + ' activities from: ' + req.getEndpoint());
+        String pretty = JSON.serializePretty(payload);
+        System.debug('RAW_PAYLOAD →\n' + pretty);
+        
+        // Execute request
+        HttpResponse res = new Http().send(req);
+        List<FlowActivity> activities = new List<FlowActivity>();
+        
+        if (res.getStatusCode() == 200) {
+            activities = parseActivityResponse(res.getBody());
+        } else {
+            System.debug(LoggingLevel.ERROR, 'HTTP Error ' + res.getStatusCode() + ': ' + res.getBody());
+            throw new CalloutException('Failed to fetch activities: HTTP ' + res.getStatusCode());
+        }
+        
+        return activities;
+    }
+    
+    // Parse the GraphQL response and convert to FlowActivity objects
+    private static List<FlowActivity> parseActivityResponse(String responseBody) {
+        List<FlowActivity> activities = new List<FlowActivity>();
+        
+        try {
+            Map<String, Object> responseMap = (Map<String, Object>) JSON.deserializeUntyped(responseBody);
+            
+            // Check for GraphQL errors
+            if (responseMap.containsKey('errors')) {
+                List<Object> errors = (List<Object>) responseMap.get('errors');
+                System.debug(LoggingLevel.ERROR, 'GraphQL Errors: ' + JSON.serialize(errors));
+                throw new CalloutException('GraphQL returned errors: ' + JSON.serialize(errors));
+            }
+            
+            // Extract data
+            Map<String, Object> data = (Map<String, Object>) responseMap.get('data');
+            if (data == null) {
+                System.debug(LoggingLevel.WARN, 'No data in GraphQL response');
+                return activities;
+            }
+            
+            Map<String, Object> activityData = (Map<String, Object>) data.get('activity');
+            if (activityData == null) {
+                System.debug(LoggingLevel.WARN, 'No activity data in response');
+                return activities;
+            }
+            
+            List<Object> edges = (List<Object>) activityData.get('edges');
+            if (edges == null) {
+                System.debug(LoggingLevel.WARN, 'No edges in activity data');
+                return activities;
+            }
+            
+            // Process each activity node
+            for (Object edge : edges) {
+                Map<String, Object> edgeMap = (Map<String, Object>) edge;
+                Map<String, Object> node = (Map<String, Object>) edgeMap.get('node');
+                
+                if (node != null) {
+                    FlowActivity activity = createFlowActivity(node);
+                    activities.add(activity);
+                }
+            }
+            
+        } catch (JSONException jsonEx) {
+            System.debug(LoggingLevel.ERROR, 'JSON parsing error: ' + jsonEx.getMessage());
+            throw new CalloutException('Failed to parse GraphQL response: ' + jsonEx.getMessage());
+        }
+        
+        return activities;
+    }
+    
+    // Convert a GraphQL node to a FlowActivity object
+    private static FlowActivity createFlowActivity(Map<String, Object> node) {
+        FlowActivity activity = new FlowActivity();
+        
+        // Basic activity info
+        activity.actionDateTime = (String) node.get('action_dtime');
+        activity.action = (String) node.get('action');
+        
+        // Resource info
+        Map<String, Object> resource = (Map<String, Object>) node.get('resource');
+        if (resource != null) {
+            activity.resourceName = (String) resource.get('name');
+            activity.resourceId = (String) resource.get('id');
+        }
+        
+        // Group info
+        Map<String, Object> groupMap = (Map<String, Object>) node.get('group');
+        if (groupMap != null) {
+            activity.groupName = (String) groupMap.get('name');
+            activity.groupId   = (String) groupMap.get('id');
+        }
+        
+        // User info
+        Map<String, Object> user = (Map<String, Object>) node.get('user');
+        if (user != null) {
+            activity.userEmail = (String) user.get('email');
+            activity.userFullName = (String) user.get('full_name');
+            activity.isStaff = (Boolean) user.get('is_staff');
+        }
+        
+        // Registration info
+        Map<String, Object> registration = (Map<String, Object>) node.get('registration');
+        if (registration != null) {
+            activity.registrationId = (String) registration.get('id');
+            activity.userId = (String) registration.get('user_id');
+            activity.pathId = (String) registration.get('path_id');
+            activity.completionState = (String) registration.get('completion_state');
+            
+            // Payment info
+            Map<String, Object> regPayment = (Map<String, Object>) registration.get('registration_payment');
+            if (regPayment != null) {
+                Map<String, Object> payment = (Map<String, Object>) regPayment.get('payment');
+                if (payment != null) {
+                    activity.paymentAmount = (Decimal) payment.get('amount');
+                }
+                
+                Map<String, Object> couponRedemption = (Map<String, Object>) regPayment.get('couponRedemption');
+                if (couponRedemption != null) {
+                    Map<String, Object> coupon = (Map<String, Object>) couponRedemption.get('coupon');
+                    if (coupon != null) {
+                        activity.couponCode = (String) coupon.get('code');
+                    }
+                }
+            }
+        }
+        
+        // Step info
+        Map<String, Object> step = (Map<String, Object>) node.get('step');
+        if (step != null) {
+            activity.stepName = (String) step.get('name');
+            activity.stepUrl = (String) step.get('url');
+            activity.needsGrading = (Boolean) step.get('item_needs_grading');
+        }
+        
+        return activity;
+    }
+    
+    // Build the GraphQL query
+    private static String buildActivityQuery() {
+        return 'query GetActivities($first: Int!) {' +
+               '  activity(first: $first) {' +
+               '    pageInfo {' +
+               '      startCursor' +
+               '      endCursor' +
+               '      hasNextPage' +
+               '    }' +
+               '    edges {' +
+               '      node {' +
+               '        action_dtime' +
+               '        action' +
+               '        resource {' +
+               '          name' +
+               '          id' +
+               '        }' +
+               '        group {' +
+               '          id' +
+               '          name' +
+               '        }' +
+               '        registration {' +
+               '          id' +
+               '          user_id' +
+               '          path_id' +
+               '          completion_state' +
+               '          registration_payment {' +
+               '            payment {' +
+               '              amount' +
+               '            }' +
+               '            couponRedemption {' +
+               '              coupon {' +
+               '                code' +
+               '              }' +
+               '            }' +
+               '          }' +
+               '        }' +
+               '        step {' +
+               '          url' +
+               '          name' +
+               '          item_needs_grading' +
+               '        }' +
+               '        user {' +
+               '          email' +
+               '          is_staff' +
+               '          full_name' +
+               '        }' +
+               '      }' +
+               '    }' +
+               '  }' +
+               '}';
+    }
+    
+    // Utility method for testing/debugging (not exposed to Flow)
+    public static void testFetch() {
+        testFetch(5);
+    }
+    
+    public static void testFetch(Integer recordCount) {
+        try {
+            List<FlowActivity> activities = fetchAndWrap(recordCount, null, null);
+            System.debug('Successfully fetched ' + activities.size() + ' activities');
+            for (FlowActivity activity : activities) {
+                System.debug('Activity: ' + activity.action + ' by ' + activity.userEmail + ' at ' + activity.actionDateTime);
+            }
+        } catch (Exception e) {
+            System.debug(LoggingLevel.ERROR, 'Test failed: ' + e.getMessage());
+        }
+    }
+}
