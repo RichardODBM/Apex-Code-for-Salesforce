@@ -69,14 +69,32 @@ public with sharing class PathwrightActivityFetcher {
         public String schoolId;
     }
     
-    // Main invocable method for Flow
+    // Output wrapper for Flow - THIS IS THE KEY CHANGE
+    public class FlowResult {
+        @InvocableVariable(label='Activities')
+        public List<FlowActivity> activities;
+        
+        @InvocableVariable(label='Success')
+        public Boolean success;
+        
+        @InvocableVariable(label='Error Message')
+        public String errorMessage;
+        
+        @InvocableVariable(label='Record Count')
+        public Integer recordCount;
+    }
+    
+    // Main invocable method for Flow - CHANGED RETURN TYPE
     @InvocableMethod(
         label='Fetch Pathwright Activities' 
         description='Fetches activities from Pathwright GraphQL API and returns them for Flow processing'
         category='Pathwright'
     )
-    public static List<FlowActivity> getActivitiesForFlow(List<FlowInput> inputs) {
-        List<FlowActivity> results = new List<FlowActivity>();
+    public static List<FlowResult> getActivitiesForFlow(List<FlowInput> inputs) {
+        List<FlowResult> results = new List<FlowResult>();
+        FlowResult result = new FlowResult();
+        result.activities = new List<FlowActivity>();
+        result.success = false;
         
         // Handle input parameters
         FlowInput input = (inputs != null && !inputs.isEmpty()) ? inputs[0] : new FlowInput();
@@ -86,14 +104,18 @@ public with sharing class PathwrightActivityFetcher {
         
         try {
             List<FlowActivity> activities = fetchAndWrap(pageSize, apiToken, schoolId);
-            // Flatten into our single results list
-            results.addAll(activities);
+            result.activities = activities;
+            result.success = true;
+            result.recordCount = activities.size();
             System.debug('Successfully fetched ' + activities.size() + ' activities for Flow');
         } catch (Exception e) {
             System.debug(LoggingLevel.ERROR, 'Error in getActivitiesForFlow: ' + e.getMessage());
-            // leave results empty rather than adding an empty sub-list
+            result.success = false;
+            result.errorMessage = e.getMessage();
+            result.recordCount = 0;
         }
         
+        results.add(result);
         return results;
     }
     
@@ -106,7 +128,7 @@ public with sharing class PathwrightActivityFetcher {
         // Always point at your Named Credential by default
         req.setEndpoint('callout:Pathwright_GraphQL');
 
-        // If the Flow passed in an explicit token, just add headers (don’t reset the endpoint)
+        // If the Flow passed in an explicit token, just add headers (don't reset the endpoint)
         if (String.isNotBlank(apiToken)) {
             // (You can still use the Named Credential endpoint – no need to hard-code the URL)
             req.setHeader('Authorization', apiToken);
@@ -237,7 +259,15 @@ public with sharing class PathwrightActivityFetcher {
             if (regPayment != null) {
                 Map<String, Object> payment = (Map<String, Object>) regPayment.get('payment');
                 if (payment != null) {
-                    activity.paymentAmount = (Decimal) payment.get('amount');
+                    // Safer casting for Decimal
+                    Object amountObj = payment.get('amount');
+                    if (amountObj != null) {
+                        if (amountObj instanceof Decimal) {
+                            activity.paymentAmount = (Decimal) amountObj;
+                        } else {
+                            activity.paymentAmount = Decimal.valueOf(String.valueOf(amountObj));
+                        }
+                    }
                 }
                 
                 Map<String, Object> couponRedemption = (Map<String, Object>) regPayment.get('couponRedemption');
