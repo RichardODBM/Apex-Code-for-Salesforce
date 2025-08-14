@@ -1,0 +1,101 @@
+// File: PWActivityFetchOnePage.cls
+// Named Credential: callout:Pathwright_GraphQL
+public with sharing class PWActivityFetchOnePage implements Queueable, Database.AllowsCallouts {
+    private Integer first;
+    public PWActivityFetchOnePage(Integer first) { this.first = (first != null && first > 0) ? first : 25; }
+
+    public void execute(QueueableContext qc) {
+        try {
+            // --- Request ---
+            HttpRequest req = new HttpRequest();
+            req.setEndpoint('callout:Pathwright_GraphQL');
+            req.setMethod('POST');
+            req.setHeader('Content-Type', 'application/json');
+
+            String q =
+                'query Q($first:Int!){ ' +
+                '  activity(first:$first){ ' +
+                '    pageInfo{ startCursor endCursor hasNextPage } ' +
+                '    edges{ node{ id action_dtime action step{url name item_needs_grading} user{ email full_name } } } ' +
+                '  } ' +
+                '}';
+
+            req.setBody(JSON.serialize(new Map<String,Object>{
+                'query' => q,
+                'variables' => new Map<String,Object>{ 'first' => first }
+            }));
+
+            HttpResponse res = new Http().send(req);
+            System.debug(LoggingLevel.INFO, 'HTTP ' + res.getStatusCode());
+            if (res.getStatusCode() != 200) { System.debug(res.getBody()); return; }
+
+            // --- Light parse for quick count (keep) ---
+            Map<String,Object> body = (Map<String,Object>) JSON.deserializeUntyped(res.getBody());
+            Map<String,Object> data = (Map<String,Object>) body.get('data');
+            Map<String,Object> act  = (data == null) ? null : (Map<String,Object>) data.get('activity');
+            List<Object> edges      = (act == null) ? new List<Object>() : (List<Object>) act.get('edges');
+            Map<String,Object> pi   = (act == null) ? null : (Map<String,Object>) act.get('pageInfo');
+            System.debug(LoggingLevel.INFO,
+                'Fetched ' + edges.size() +
+                ' rows | hasNext=' + String.valueOf(pi == null ? null : pi.get('hasNextPage')));
+
+            // --- Upsert the page into PW_Activity_Data__c ---
+            List<PW_Activity_Data__c> rows = new List<PW_Activity_Data__c>();
+            for (Object eo : edges) {
+                Map<String,Object> node = (Map<String,Object>) ((Map<String,Object>) eo).get('node');
+                if (node == null) continue;
+
+                PW_Activity_Data__c r = new PW_Activity_Data__c();
+                String actionId = String.valueOf(node.get('id'));
+                r.put('PW_Action_ID__c', actionId);  // External ID
+                r.Name           = actionId;         // optional
+                r.Action_Type__c = (String) node.get('action');
+                r.Action_Time__c = toDatetimeUtc((String) node.get('action_dtime'));
+
+                Map<String,Object> step = (Map<String,Object>) node.get('step');
+                if (step != null) {
+                    r.Step_Name__c = (String) step.get('name');
+                    r.Step_Url__c  = toValidUrl((String) step.get('url')); // avoids invalid URL DML errors
+                }
+
+                Map<String,Object> usr = (Map<String,Object>) node.get('user');
+                if (usr != null) r.Email__c = (String) usr.get('email');
+
+                rows.add(r);
+            }
+
+            if (!rows.isEmpty()) {
+                Database.UpsertResult[] rs = Database.upsert(
+                    rows,
+                    Schema.SObjectType.PW_Activity_Data__c.fields.getMap().get('PW_Action_ID__c'),
+                    false
+                );
+                Integer created = 0, updated = 0, failed = 0;
+                for (Database.UpsertResult ur : rs) {
+                    if (ur.isSuccess()) {
+                        if (ur.isCreated()) created++; else updated++;
+                    } else {
+                        failed++;
+                        for (Database.Error e : ur.getErrors()) {
+                            System.debug(LoggingLevel.ERROR, 'Upsert error: ' + e.getStatusCode() + ' ' + e.getMessage());
+                        }
+                    }
+                }
+                System.debug(LoggingLevel.INFO, 'Upsert summary: created=' + created + ', updated=' + updated + ', failed=' + failed);
+            }
+        } catch (Exception e) {
+            System.debug(LoggingLevel.ERROR, 'Callout failed: ' + e.getMessage());
+        }
+    }
+
+    // ---- helpers ----
+    private static Datetime toDatetimeUtc(String iso) {
+        if (String.isBlank(iso)) return null;
+        try { return Datetime.valueOfGmt(iso.replace('T',' ').replace('Z','')); } catch (Exception e) { return null; }
+    }
+    private static String toValidUrl(String u) {
+        if (String.isBlank(u)) return null;
+        if (u.startsWith('http://') || u.startsWith('https://')) return u;
+        return null; // skip relative paths like "/library/..."
+    }
+}
