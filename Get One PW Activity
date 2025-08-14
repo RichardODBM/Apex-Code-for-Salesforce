@@ -12,12 +12,29 @@ public with sharing class PWActivityFetchOnePage implements Queueable, Database.
             req.setHeader('Content-Type', 'application/json');
 
             String q =
-                'query Q($first:Int!){ ' +
-                '  activity(first:$first){ ' +
-                '    pageInfo{ startCursor endCursor hasNextPage } ' +
-                '    edges{ node{ id action_dtime action step{url name item_needs_grading} user{ email full_name } } } ' +
-                '  } ' +
-                '}';
+            'query Query($first: Int!) {' + '\n' +
+            '  activity(first: $first) {' + '\n' +
+            '    pageInfo { startCursor endCursor hasNextPage }' + '\n' +
+            '    edges {' + '\n' +
+            '      node {' + '\n' +
+            '        action_dtime' + '\n' +
+            '        action' + '\n' +
+            '        resource { name id }' + '\n' +
+            '        group { id name }' + '\n' +
+            '        registration {' + '\n' +
+            '          id user_id path_id completion_state' + '\n' +
+            '          registration_payment {' + '\n' +
+            '            payment { amount }' + '\n' +
+            '            couponRedemption { coupon { code } }' + '\n' +
+            '          }' + '\n' +
+            '        }' + '\n' +
+            '        step { url name item_needs_grading }' + '\n' +
+            '        user { email full_name membership { role } }' + '\n' +
+            '        id' + '\n' +
+            '      }' + '\n' +
+            '    }' + '\n' +
+            '  }' + '\n' +
+            '}';
 
             req.setBody(JSON.serialize(new Map<String,Object>{
                 'query' => q,
@@ -43,20 +60,50 @@ public with sharing class PWActivityFetchOnePage implements Queueable, Database.
                 if (node == null) continue;
 
                 PW_Activity_Data__c r = new PW_Activity_Data__c();
+
                 String actionId = String.valueOf(node.get('id'));
                 r.put('PW_Action_ID__c', actionId);
-                r.Name           = actionId;
+                r.Name = actionId;
+
                 r.Action_Type__c = (String) node.get('action');
                 r.Action_Time__c = toDatetimeUtc((String) node.get('action_dtime'));
+
+                Map<String,Object> resource = (Map<String,Object>) node.get('resource');
+                if (resource != null) {
+                    r.Resource_Name__c = (String) resource.get('name');
+                }
+
+                Map<String,Object> grp = (Map<String,Object>) node.get('group');
+                if (grp != null) {
+                    r.PW_Cohort_ID__c = (String) grp.get('id');
+                    r.Cohort_Name__c   = (String) grp.get('name');
+                }
+
+                Map<String,Object> reg = (Map<String,Object>) node.get('registration');
+                if (reg != null) {
+                    Map<String,Object> regPay = (Map<String,Object>) reg.get('registration_payment');
+                    if (regPay != null) {
+                        Map<String,Object> cr = (Map<String,Object>) regPay.get('couponRedemption');
+                        if (cr != null) {
+                            Map<String,Object> coupon = (Map<String,Object>) cr.get('coupon');
+                            if (coupon != null) r.Coupon_Code__c = (String) coupon.get('code');
+                        }
+                    }
+                }
 
                 Map<String,Object> step = (Map<String,Object>) node.get('step');
                 if (step != null) {
                     r.Step_Name__c = (String) step.get('name');
-                    r.Step_Url__c  = toValidUrl((String) step.get('url'));
+                    r.Step_Url__c = (String) step.get('url');
+                    r.Requires_Grading__c = (step.containsKey('item_needs_grading')
+                        ? Boolean.valueOf(String.valueOf(step.get('item_needs_grading')))
+                        : false);
                 }
 
                 Map<String,Object> usr = (Map<String,Object>) node.get('user');
-                if (usr != null) r.Email__c = (String) usr.get('email');
+                if (usr != null) {
+                    r.Email__c = (String) usr.get('email');
+                }
 
                 rows.add(r);
             }
@@ -95,7 +142,6 @@ public with sharing class PWActivityFetchOnePage implements Queueable, Database.
         return null;
     }
 
-    // === Flow invocable API (inside this class) ===
     public class FlowInput {
         @InvocableVariable public Integer pageSize;
     }
@@ -104,11 +150,8 @@ public with sharing class PWActivityFetchOnePage implements Queueable, Database.
         @InvocableVariable public String message;
     }
 
-    @InvocableMethod(
-        label='Run Apex to Sync Activity Data from PW'
-        description='Enqueues PWActivityFetchOnePage with an optional page size (default 25).'
-    )
-    public static List<FlowOutput> runFromFlow(List<FlowInput> inputs){
+    @InvocableMethod(label='Run Apex to Sync Activity Data from PW' description='Enqueues PWActivityFetchOnePage with an optional page size (default 25).')
+    public static List<FlowOutput> runFromFlow(List<FlowInput> inputs) {
         Integer first = 25;
         if (inputs != null && !inputs.isEmpty() && inputs[0] != null
             && inputs[0].pageSize != null && inputs[0].pageSize > 0) {
