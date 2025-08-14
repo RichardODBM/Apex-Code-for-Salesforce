@@ -6,7 +6,6 @@ public with sharing class PWActivityFetchOnePage implements Queueable, Database.
 
     public void execute(QueueableContext qc) {
         try {
-            // --- Request ---
             HttpRequest req = new HttpRequest();
             req.setEndpoint('callout:Pathwright_GraphQL');
             req.setMethod('POST');
@@ -29,7 +28,6 @@ public with sharing class PWActivityFetchOnePage implements Queueable, Database.
             System.debug(LoggingLevel.INFO, 'HTTP ' + res.getStatusCode());
             if (res.getStatusCode() != 200) { System.debug(res.getBody()); return; }
 
-            // --- Light parse for quick count (keep) ---
             Map<String,Object> body = (Map<String,Object>) JSON.deserializeUntyped(res.getBody());
             Map<String,Object> data = (Map<String,Object>) body.get('data');
             Map<String,Object> act  = (data == null) ? null : (Map<String,Object>) data.get('activity');
@@ -39,7 +37,6 @@ public with sharing class PWActivityFetchOnePage implements Queueable, Database.
                 'Fetched ' + edges.size() +
                 ' rows | hasNext=' + String.valueOf(pi == null ? null : pi.get('hasNextPage')));
 
-            // --- Upsert the page into PW_Activity_Data__c ---
             List<PW_Activity_Data__c> rows = new List<PW_Activity_Data__c>();
             for (Object eo : edges) {
                 Map<String,Object> node = (Map<String,Object>) ((Map<String,Object>) eo).get('node');
@@ -47,15 +44,15 @@ public with sharing class PWActivityFetchOnePage implements Queueable, Database.
 
                 PW_Activity_Data__c r = new PW_Activity_Data__c();
                 String actionId = String.valueOf(node.get('id'));
-                r.put('PW_Action_ID__c', actionId);  // External ID
-                r.Name           = actionId;         // optional
+                r.put('PW_Action_ID__c', actionId);
+                r.Name           = actionId;
                 r.Action_Type__c = (String) node.get('action');
                 r.Action_Time__c = toDatetimeUtc((String) node.get('action_dtime'));
 
                 Map<String,Object> step = (Map<String,Object>) node.get('step');
                 if (step != null) {
                     r.Step_Name__c = (String) step.get('name');
-                    r.Step_Url__c  = toValidUrl((String) step.get('url')); // avoids invalid URL DML errors
+                    r.Step_Url__c  = toValidUrl((String) step.get('url'));
                 }
 
                 Map<String,Object> usr = (Map<String,Object>) node.get('user');
@@ -88,7 +85,6 @@ public with sharing class PWActivityFetchOnePage implements Queueable, Database.
         }
     }
 
-    // ---- helpers ----
     private static Datetime toDatetimeUtc(String iso) {
         if (String.isBlank(iso)) return null;
         try { return Datetime.valueOfGmt(iso.replace('T',' ').replace('Z','')); } catch (Exception e) { return null; }
@@ -96,6 +92,36 @@ public with sharing class PWActivityFetchOnePage implements Queueable, Database.
     private static String toValidUrl(String u) {
         if (String.isBlank(u)) return null;
         if (u.startsWith('http://') || u.startsWith('https://')) return u;
-        return null; // skip relative paths like "/library/..."
+        return null;
+    }
+
+    // === Flow invocable API (inside this class) ===
+    public class FlowInput {
+        @InvocableVariable public Integer pageSize;
+    }
+    public class FlowOutput {
+        @InvocableVariable public String jobId;
+        @InvocableVariable public String message;
+    }
+
+    @InvocableMethod(
+        label='Run Apex to Sync Activity Data from PW'
+        description='Enqueues PWActivityFetchOnePage with an optional page size (default 25).'
+    )
+    public static List<FlowOutput> runFromFlow(List<FlowInput> inputs){
+        Integer first = 25;
+        if (inputs != null && !inputs.isEmpty() && inputs[0] != null
+            && inputs[0].pageSize != null && inputs[0].pageSize > 0) {
+            first = inputs[0].pageSize;
+        }
+
+        FlowOutput o = new FlowOutput();
+        try {
+            o.jobId = (String) System.enqueueJob(new PWActivityFetchOnePage(first));
+            o.message = 'Enqueued with pageSize=' + first;
+        } catch (Exception e) {
+            o.message = 'Failed to enqueue: ' + e.getMessage();
+        }
+        return new List<FlowOutput>{ o };
     }
 }
