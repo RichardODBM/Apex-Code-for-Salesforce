@@ -59,24 +59,22 @@ public with sharing class PWActivityFetchOnePage implements Queueable, Database.
                 Map<String,Object> node = (Map<String,Object>) ((Map<String,Object>) eo).get('node');
                 if (node == null) continue;
 
-                PW_Activity_Data__c r = new PW_Activity_Data__c();
+                String actionId = asString(node.get('id'));
+                if (String.isBlank(actionId)) continue;
 
-                String actionId = String.valueOf(node.get('id'));
+                PW_Activity_Data__c r = new PW_Activity_Data__c();
                 r.put('PW_Action_ID__c', actionId);
                 r.Name = actionId;
-
-                r.Action_Type__c = (String) node.get('action');
-                r.Action_Time__c = toDatetimeUtc((String) node.get('action_dtime'));
+                r.Action_Type__c = asString(node.get('action'));
+                r.Action_Time__c = toDatetimeUtc(asString(node.get('action_dtime')));
 
                 Map<String,Object> resource = (Map<String,Object>) node.get('resource');
-                if (resource != null) {
-                    r.Resource_Name__c = (String) resource.get('name');
-                }
+                if (resource != null) r.Resource_Name__c = asString(resource.get('name'));
 
                 Map<String,Object> grp = (Map<String,Object>) node.get('group');
                 if (grp != null) {
-                    r.PW_Cohort_ID__c = (String) grp.get('id');
-                    r.Cohort_Name__c   = (String) grp.get('name');
+                    r.PW_Cohort_ID__c = asString(grp.get('id'));
+                    r.Cohort_Name__c  = asString(grp.get('name'));
                 }
 
                 Map<String,Object> reg = (Map<String,Object>) node.get('registration');
@@ -86,24 +84,20 @@ public with sharing class PWActivityFetchOnePage implements Queueable, Database.
                         Map<String,Object> cr = (Map<String,Object>) regPay.get('couponRedemption');
                         if (cr != null) {
                             Map<String,Object> coupon = (Map<String,Object>) cr.get('coupon');
-                            if (coupon != null) r.Coupon_Code__c = (String) coupon.get('code');
+                            if (coupon != null) r.Coupon_Code__c = asString(coupon.get('code'));
                         }
                     }
                 }
 
                 Map<String,Object> step = (Map<String,Object>) node.get('step');
                 if (step != null) {
-                    r.Step_Name__c = (String) step.get('name');
-                    r.Step_Url__c = (String) step.get('url');
-                    r.Requires_Grading__c = (step.containsKey('item_needs_grading')
-                        ? Boolean.valueOf(String.valueOf(step.get('item_needs_grading')))
-                        : false);
+                    r.Step_Name__c = asString(step.get('name'));
+                    r.Step_Url__c = asString(step.get('url'));
+                    r.Requires_Grading__c = asBool(step.get('item_needs_grading'));
                 }
 
                 Map<String,Object> usr = (Map<String,Object>) node.get('user');
-                if (usr != null) {
-                    r.Email__c = (String) usr.get('email');
-                }
+                if (usr != null) r.Email__c = asString(usr.get('email'));
 
                 rows.add(r);
             }
@@ -136,11 +130,8 @@ public with sharing class PWActivityFetchOnePage implements Queueable, Database.
         if (String.isBlank(iso)) return null;
         try { return Datetime.valueOfGmt(iso.replace('T',' ').replace('Z','')); } catch (Exception e) { return null; }
     }
-    private static String toValidUrl(String u) {
-        if (String.isBlank(u)) return null;
-        if (u.startsWith('http://') || u.startsWith('https://')) return u;
-        return null;
-    }
+    private static String asString(Object o) { return o == null ? null : String.valueOf(o); }
+    private static Boolean asBool(Object o) { return o == null ? false : Boolean.valueOf(String.valueOf(o)); }
 
     public class FlowInput {
         @InvocableVariable public Integer pageSize;
