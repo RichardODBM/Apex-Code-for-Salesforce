@@ -1,0 +1,224 @@
+// File: PWCohortSync.cls
+// Named Credential: callout:Pathwright_GraphQL
+public with sharing class PWCohortSync implements Queueable, Database.AllowsCallouts {
+    private Integer first;
+    private String actionType; // Optional filter for activity action type
+
+    public PWCohortSync(Integer first, String actionType) {
+        this.first = (first != null && first > 0) ? first : 25;
+        this.actionType = actionType;
+    }
+
+    public void execute(QueueableContext qc) {
+        try {
+            HttpRequest req = new HttpRequest();
+            req.setEndpoint('callout:Pathwright_GraphQL');
+            req.setMethod('POST');
+            req.setHeader('Content-Type', 'application/json');
+
+            // Build GraphQL query without illegal line-break literals
+            String q = String.join(new List<String>{
+                'query Query($first: Int!, $actionType: ActionTypeFilter) {',
+                '  activity(first: $first, action_type: $actionType) {',
+                '    edges {',
+                '      node {',
+                '        action_type',
+                '        action_dtime',
+                '        group {',
+                '          id',
+                '          name',
+                '          created',
+                '          price',
+                '          description',
+                '          status',
+                '          registration_ends',
+                '          registration_starts',
+                '          source_cohort_id',
+                '          access_ends',
+                '          access_starts',
+                '          invite_urls {',
+                '            student',
+                '            moderator',
+                '            teacher',
+                '            observer',
+                '          }',
+                '          resource {',
+                '            name',
+                '            id',
+                '          }',
+                '        }',
+                '      }',
+                '    }',
+                '  }',
+                '}'
+            }, '\n');
+
+            Map<String, Object> vars = new Map<String, Object>{
+                'first' => first,
+                'actionType' => actionType
+            };
+            req.setBody(JSON.serialize(new Map<String,Object>{
+                'query' => q,
+                'variables' => vars
+            }));
+
+            HttpResponse res = new Http().send(req);
+            System.debug(LoggingLevel.INFO, 'HTTP ' + res.getStatusCode());
+            if (res.getStatusCode() != 200) {
+                System.debug(res.getBody());
+                return;
+            }
+
+            Map<String,Object> body = (Map<String,Object>) JSON.deserializeUntyped(res.getBody());
+            Map<String,Object> dataMap = (Map<String,Object>) body.get('data');
+            Map<String,Object> act = (dataMap == null) ? null : (Map<String,Object>) dataMap.get('activity');
+            List<Object> edges = (act == null) ? new List<Object>() : (List<Object>) act.get('edges');
+
+            List<Cohort__c> rows = new List<Cohort__c>();
+            for (Object eo : edges) {
+                Map<String,Object> node = (Map<String,Object>) ((Map<String,Object>) eo).get('node');
+                if (node == null) continue;
+
+                Map<String,Object> grp = (Map<String,Object>) node.get('group');
+                if (grp == null) continue;
+
+                // External ID
+                String cohortId = asString(grp.get('id'));
+                if (String.isBlank(cohortId)) continue;
+
+                Cohort__c rec = new Cohort__c();
+
+                // *** CHANGED: set Name to PW Cohort ID (external key) ***
+                rec.Name = cohortId;
+
+                // Name/status/description/price
+                String cohortName = asString(grp.get('name'));
+
+                // *** CHANGED: keep human-readable name in cohort_name__c ***
+                rec.cohort_name__c = cohortName;
+
+                rec.status__c = asString(grp.get('status'));
+                if (grp.get('price') != null) {
+                    rec.price__c = Decimal.valueOf(String.valueOf(grp.get('price')));
+                }
+
+                // Dates (unchanged)
+                setDateIfPresent(rec, 'learner_access_starts__c', asString(grp.get('access_starts')));
+                setDateIfPresent(rec, 'learner_access_ends__c', asString(grp.get('access_ends')));
+                setDateIfPresent(rec, 'registration_starts__c', asString(grp.get('registration_starts')));
+                setDateIfPresent(rec, 'registration_ends__c', asString(grp.get('registration_ends')));
+
+                // Invite URLs (unchanged)
+                Map<String,Object> invites = (Map<String,Object>) grp.get('invite_urls');
+                String studentUrl, modUrl, teachUrl, obsUrl;
+                if (invites != null) {
+                    studentUrl = asString(invites.get('student'));
+                    modUrl = asString(invites.get('moderator'));
+                    teachUrl = asString(invites.get('teacher'));
+                    obsUrl = asString(invites.get('observer'));
+                    rec.learner_invite_url__c = studentUrl;
+                    rec.moderator_invite_url__c = modUrl;
+                    rec.teacher_invite_url__c = teachUrl;
+                    rec.observer_invite_url__c = obsUrl;
+                }
+
+                // Cohort URL (unchanged)
+                String chosen = firstNonBlank(new List<String>{teachUrl, modUrl, studentUrl, obsUrl});
+                String cohortUrl = deriveCohortUrl(chosen);
+                if (!String.isBlank(cohortUrl)) rec.cohort_url__c = cohortUrl;
+
+                // Course mapping (unchanged)
+                Map<String,Object> resMap = (Map<String,Object>) grp.get('resource');
+                if (resMap != null) {
+                    String pwId = asString(resMap.get('id'));
+                    String name = asString(resMap.get('name'));
+                    if (!String.isBlank(pwId)) rec.put('PW_Course_ID__c', pwId);
+                    Id lookupId = findPWCourseLookupId(name);
+                    if (lookupId != null) rec.PW_Course_Name__c = lookupId;
+                }
+
+                rows.add(rec);
+            }
+
+            if (!rows.isEmpty()) {
+                // *** CHANGED: upsert by Name (external ID per your mapping) ***
+                Database.upsert(rows, Schema.Cohort__c.fields.Name, false);
+            }
+        } catch (Exception e) {
+            System.debug(LoggingLevel.ERROR, 'Callout failed: ' + e.getMessage());
+        }
+    }
+
+    private static String asString(Object o) {
+        return o == null ? null : String.valueOf(o);
+    }
+
+    private static void setDateIfPresent(SObject rec, String fieldApi, String iso) {
+        if (String.isBlank(iso) || iso.length() < 10) return;
+        rec.put(fieldApi, Date.valueOf(iso.substring(0,10)));
+    }
+
+    private static String firstNonBlank(List<String> vals) {
+        for (String v : vals) if (!String.isBlank(v)) return v;
+        return null;
+    }
+
+    private static String deriveCohortUrl(String inviteUrl) {
+        if (String.isBlank(inviteUrl)) return null;
+        String u = inviteUrl;
+        Integer q = u.indexOf('?');
+        if (q > -1) u = u.substring(0, q);
+        Integer p = u.indexOf('/register/');
+        if (p == -1) return null;
+        String base = u.substring(0, p);
+        String tail = u.substring(p + '/register/'.length());
+        Integer s = tail.indexOf('/');
+        if (s > -1) tail = tail.substring(0, s);
+        return base + '/' + tail + '/path/';
+    }
+
+    // API name of the PW Course object (used for lookup)
+    private static final String COURSE_OBJ_API = 'PW_Course__c';
+
+    // Looks up PW Course record by Name and returns its Id for a lookup field assignment.
+    // If not found, returns null.
+    private static Id findPWCourseLookupId(String courseName) {
+        try {
+            if (String.isBlank(courseName)) return null;
+            String soql = 'SELECT Id FROM ' + COURSE_OBJ_API + ' WHERE Name = :courseName LIMIT 1';
+            List<SObject> rows = Database.query(soql);
+            return rows.isEmpty() ? null : (Id) rows[0].get('Id');
+        } catch (Exception e) {
+            System.debug(LoggingLevel.WARN, 'PW course lookup failed for name="' + courseName + '" using object ' + COURSE_OBJ_API + ': ' + e.getMessage());
+            return null;
+        }
+    }
+
+    public class FlowInput {
+        @InvocableVariable public Integer pageSize;
+        @InvocableVariable public String actionType;
+    }
+
+    public class FlowOutput {
+        @InvocableVariable public String jobId;
+        @InvocableVariable public String message;
+    }
+
+    @InvocableMethod(label='Run Apex to Sync Cohort Data from PW' description='Enqueues PWCohortSync with optional page size (default 25) and action type filter.')
+    public static List<FlowOutput> runFromFlow(List<FlowInput> inputs) {
+        Integer first = 25;
+        String actionType;
+        if (inputs != null && !inputs.isEmpty() && inputs[0] != null) {
+            if (inputs[0].pageSize != null && inputs[0].pageSize > 0) first = inputs[0].pageSize;
+            actionType = inputs[0].actionType;
+        }
+        FlowOutput out = new FlowOutput();
+        try {
+            out.jobId = (String) System.enqueueJob(new PWCohortSync(first, actionType));
+            out.message = 'Enqueued pageSize=' + first + (actionType == null ? '' : ' | actionType=' + actionType);
+        } catch (Exception e) {
+            out.message = 'Failed to enqueue: ' + e.getMessage();
+        }
+        return new List<FlowOutput>{ out };
+    }
+}
