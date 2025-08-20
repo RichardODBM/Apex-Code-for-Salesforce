@@ -79,12 +79,24 @@ public with sharing class PWActivityFetchOnePage implements Queueable, Database.
 
                 Map<String,Object> reg = (Map<String,Object>) node.get('registration');
                 if (reg != null) {
+                    // Registration ID (Number 18,0)
+                    Object regIdObj = reg.get('id');
+                    r.PW_Registration_ID__c = (regIdObj == null) ? null : Decimal.valueOf(String.valueOf(regIdObj));
+                    System.debug(LoggingLevel.INFO, 'PWActivity: set PW_Registration_ID__c=' + String.valueOf(r.PW_Registration_ID__c));
+
+                    // Payment + coupon details
                     Map<String,Object> regPay = (Map<String,Object>) reg.get('registration_payment');
                     if (regPay != null) {
                         Map<String,Object> cr = (Map<String,Object>) regPay.get('couponRedemption');
                         if (cr != null) {
                             Map<String,Object> coupon = (Map<String,Object>) cr.get('coupon');
                             if (coupon != null) r.Coupon_Code__c = asString(coupon.get('code'));
+                        }
+                        Map<String,Object> pay = (Map<String,Object>) regPay.get('payment');
+                        if (pay != null) {
+                            Object amtObj = pay.get('amount');
+                            r.Payment_Amount__c = (amtObj == null) ? null : Decimal.valueOf(String.valueOf(amtObj));
+                            System.debug(LoggingLevel.INFO, 'PWActivity: set Payment_Amount__c=' + String.valueOf(r.Payment_Amount__c));
                         }
                     }
                 }
@@ -101,7 +113,6 @@ public with sharing class PWActivityFetchOnePage implements Queueable, Database.
 
                 rows.add(r);
             }
-
             if (!rows.isEmpty()) {
                 Database.UpsertResult[] rs = Database.upsert(
                     rows,
