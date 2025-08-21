@@ -1,224 +1,175 @@
-// File: PWCohortSync.cls
+// File: PWCohortsFetchUpdates.cls
 // Named Credential: callout:Pathwright_GraphQL
-public with sharing class PWCohortSync implements Queueable, Database.AllowsCallouts {
+public with sharing class PWCohortsFetchUpdates implements Queueable, Database.AllowsCallouts {
+    // ===== Properties =====
     private Integer first;
-    private String actionType; // Optional filter for activity action type
+    private String actionType; // optional filter from Flow
 
-    public PWCohortSync(Integer first, String actionType) {
-        this.first = (first != null && first > 0) ? first : 25;
+    // ===== Constructor =====
+    public PWCohortsFetchUpdates(Integer first, String actionType) {
+        this.first = (first != null && first > 0) ? first : 50;
         this.actionType = actionType;
     }
 
+    // ===== Queueable Entry Point =====
     public void execute(QueueableContext qc) {
         try {
+            // --- Build HTTP Request ---
             HttpRequest req = new HttpRequest();
             req.setEndpoint('callout:Pathwright_GraphQL');
             req.setMethod('POST');
             req.setHeader('Content-Type', 'application/json');
 
-            // Build GraphQL query without illegal line-break literals
-            String q = String.join(new List<String>{
-                'query Query($first: Int!, $actionType: ActionTypeFilter) {',
-                '  activity(first: $first, action_type: $actionType) {',
-                '    edges {',
-                '      node {',
-                '        action_type',
-                '        action_dtime',
-                '        group {',
-                '          id',
-                '          name',
-                '          created',
-                '          price',
-                '          description',
-                '          status',
-                '          registration_ends',
-                '          registration_starts',
-                '          source_cohort_id',
-                '          access_ends',
-                '          access_starts',
-                '          invite_urls {',
-                '            student',
-                '            moderator',
-                '            teacher',
-                '            observer',
-                '          }',
-                '          resource {',
-                '            name',
-                '            id',
-                '          }',
-                '        }',
-                '      }',
-                '    }',
-                '  }',
-                '}'
-            }, '\n');
+            // --- GraphQL Query (replaced with new version) ---
+            String q = 'query Query($first: Int!, $actionType: ActionTypeFilter) { activity(first: $first, action_type: $actionType) { edges { node { action_type action_dtime group { id name created price description status registration_ends registration_starts source_cohort_id access_ends access_starts invite_urls { student moderator teacher observer } resource { name id } } } } } }';
+            
+            // --- GraphQL Variables ---
+            Map<String, Object> vars = new Map<String, Object>{ 'first' => first };
+            if (String.isNotBlank(actionType)) {
+                vars.put('actionType', new Map<String, Object>{ 'in' => actionType });
+            } else {
+                vars.put('actionType', null);
+            }
 
-            Map<String, Object> vars = new Map<String, Object>{
-                'first' => first,
-                'actionType' => actionType
-            };
             req.setBody(JSON.serialize(new Map<String,Object>{
                 'query' => q,
                 'variables' => vars
             }));
 
+            // --- Send Request ---
             HttpResponse res = new Http().send(req);
             System.debug(LoggingLevel.INFO, 'HTTP ' + res.getStatusCode());
-            if (res.getStatusCode() != 200) {
-                System.debug(res.getBody());
-                return;
+            if (res.getStatusCode() != 200) { 
+                System.debug(res.getBody()); 
+                return; 
             }
 
+            // --- Parse Response ---
             Map<String,Object> body = (Map<String,Object>) JSON.deserializeUntyped(res.getBody());
-            Map<String,Object> dataMap = (Map<String,Object>) body.get('data');
-            Map<String,Object> act = (dataMap == null) ? null : (Map<String,Object>) dataMap.get('activity');
-            List<Object> edges = (act == null) ? new List<Object>() : (List<Object>) act.get('edges');
+            Map<String,Object> data = (Map<String,Object>) body.get('data');
+            Map<String,Object> act  = (data == null) ? null : (Map<String,Object>) data.get('activity');
+            List<Object> edges      = (act == null) ? new List<Object>() : (List<Object>) act.get('edges');
+            System.debug(LoggingLevel.INFO, 'Fetched ' + edges.size() + ' rows | actionType=' + String.valueOf(actionType));
 
-            List<Cohort__c> rows = new List<Cohort__c>();
+            // --- Transform into SObjects ---
+            List<cohort__c> rows = new List<cohort__c>();
+            System.debug('Starting transformation of ' + edges.size() + ' edges');
+
             for (Object eo : edges) {
-                Map<String,Object> node = (Map<String,Object>) ((Map<String,Object>) eo).get('node');
-                if (node == null) continue;
+                System.debug('Processing edge: ' + JSON.serialize(eo));
+                
+                Map<String,Object> edge = (Map<String,Object>) eo;
+                Map<String,Object> node = (Map<String,Object>) edge.get('node');
+                System.debug('Extracted node: ' + JSON.serialize(node));
+                
+                if (node == null) {
+                    System.debug('Node is null, skipping');
+                    continue;
+                }
 
                 Map<String,Object> grp = (Map<String,Object>) node.get('group');
-                if (grp == null) continue;
-
-                // External ID
-                String cohortId = asString(grp.get('id'));
-                if (String.isBlank(cohortId)) continue;
-
-                Cohort__c rec = new Cohort__c();
-
-                // *** CHANGED: set Name to PW Cohort ID (external key) ***
-                rec.Name = cohortId;
-
-                // Name/status/description/price
-                String cohortName = asString(grp.get('name'));
-
-                // *** CHANGED: keep human-readable name in cohort_name__c ***
-                rec.cohort_name__c = cohortName;
-
-                rec.status__c = asString(grp.get('status'));
-                if (grp.get('price') != null) {
-                    rec.price__c = Decimal.valueOf(String.valueOf(grp.get('price')));
+                System.debug('Extracted group: ' + JSON.serialize(grp));
+                
+                if (grp != null) {
+                    String cohortId = asString(grp.get('id'));
+                    String cohortName = asString(grp.get('name'));
+                    System.debug('Extracted values - ID: ' + cohortId + ', Name: ' + cohortName);
+                    
+                    cohort__c r = new cohort__c();
+                    r.pw_cohort_id__c = cohortId;
+                    r.cohort_name__c = cohortName;
+                    
+                    System.debug('Created record: ' + JSON.serialize(r));
+                    rows.add(r);
+                } else {
+                    System.debug('Group is null, skipping');
                 }
-
-                // Dates (unchanged)
-                setDateIfPresent(rec, 'learner_access_starts__c', asString(grp.get('access_starts')));
-                setDateIfPresent(rec, 'learner_access_ends__c', asString(grp.get('access_ends')));
-                setDateIfPresent(rec, 'registration_starts__c', asString(grp.get('registration_starts')));
-                setDateIfPresent(rec, 'registration_ends__c', asString(grp.get('registration_ends')));
-
-                // Invite URLs (unchanged)
-                Map<String,Object> invites = (Map<String,Object>) grp.get('invite_urls');
-                String studentUrl, modUrl, teachUrl, obsUrl;
-                if (invites != null) {
-                    studentUrl = asString(invites.get('student'));
-                    modUrl = asString(invites.get('moderator'));
-                    teachUrl = asString(invites.get('teacher'));
-                    obsUrl = asString(invites.get('observer'));
-                    rec.learner_invite_url__c = studentUrl;
-                    rec.moderator_invite_url__c = modUrl;
-                    rec.teacher_invite_url__c = teachUrl;
-                    rec.observer_invite_url__c = obsUrl;
-                }
-
-                // Cohort URL (unchanged)
-                String chosen = firstNonBlank(new List<String>{teachUrl, modUrl, studentUrl, obsUrl});
-                String cohortUrl = deriveCohortUrl(chosen);
-                if (!String.isBlank(cohortUrl)) rec.cohort_url__c = cohortUrl;
-
-                // Course mapping (unchanged)
-                Map<String,Object> resMap = (Map<String,Object>) grp.get('resource');
-                if (resMap != null) {
-                    String pwId = asString(resMap.get('id'));
-                    String name = asString(resMap.get('name'));
-                    if (!String.isBlank(pwId)) rec.put('PW_Course_ID__c', pwId);
-                    Id lookupId = findPWCourseLookupId(name);
-                    if (lookupId != null) rec.PW_Course_Name__c = lookupId;
-                }
-
-                rows.add(rec);
             }
 
+            System.debug('Final rows list size: ' + rows.size());
+            System.debug('Final rows content: ' + JSON.serialize(rows));
+
+            // --- Upsert to Salesforce ---
             if (!rows.isEmpty()) {
-                // *** CHANGED: upsert by Name (external ID per your mapping) ***
-                Database.upsert(rows, Schema.Cohort__c.fields.Name, false);
+                System.debug('About to upsert ' + rows.size() + ' records');
+                
+                // Use explicit external ID field
+                Database.UpsertResult[] rs = Database.upsert(rows, cohort__c.pw_cohort_id__c, false);
+                
+                Integer created = 0, updated = 0, failed = 0;
+                for (Database.UpsertResult ur : rs) {
+                    if (ur.isSuccess()) {
+                        if (ur.isCreated()) { created++; } else { updated++; }
+                    } else {
+                        failed++;
+                        System.debug(LoggingLevel.ERROR, 'Upsert failed for record: ' + JSON.serialize(ur));
+                        for (Database.Error e : ur.getErrors()) {
+                            System.debug(LoggingLevel.ERROR, 'Upsert error: ' + e.getStatusCode() + ' - ' + e.getMessage());
+                            System.debug(LoggingLevel.ERROR, 'Affected fields: ' + e.getFields());
+                        }
+                    }
+                }
+                System.debug(LoggingLevel.INFO, 'Upsert summary: created=' + created + ', updated=' + updated + ', failed=' + failed);
+            } else {
+                System.debug('No rows to upsert - rows list is empty');
             }
+            
         } catch (Exception e) {
             System.debug(LoggingLevel.ERROR, 'Callout failed: ' + e.getMessage());
         }
     }
 
-    private static String asString(Object o) {
-        return o == null ? null : String.valueOf(o);
-    }
-
-    private static void setDateIfPresent(SObject rec, String fieldApi, String iso) {
-        if (String.isBlank(iso) || iso.length() < 10) return;
-        rec.put(fieldApi, Date.valueOf(iso.substring(0,10)));
-    }
-
-    private static String firstNonBlank(List<String> vals) {
-        for (String v : vals) if (!String.isBlank(v)) return v;
-        return null;
-    }
-
-    private static String deriveCohortUrl(String inviteUrl) {
-        if (String.isBlank(inviteUrl)) return null;
-        String u = inviteUrl;
-        Integer q = u.indexOf('?');
-        if (q > -1) u = u.substring(0, q);
-        Integer p = u.indexOf('/register/');
-        if (p == -1) return null;
-        String base = u.substring(0, p);
-        String tail = u.substring(p + '/register/'.length());
-        Integer s = tail.indexOf('/');
-        if (s > -1) tail = tail.substring(0, s);
-        return base + '/' + tail + '/path/';
-    }
-
-    // API name of the PW Course object (used for lookup)
-    private static final String COURSE_OBJ_API = 'PW_Course__c';
-
-    // Looks up PW Course record by Name and returns its Id for a lookup field assignment.
-    // If not found, returns null.
-    private static Id findPWCourseLookupId(String courseName) {
-        try {
-            if (String.isBlank(courseName)) return null;
-            String soql = 'SELECT Id FROM ' + COURSE_OBJ_API + ' WHERE Name = :courseName LIMIT 1';
-            List<SObject> rows = Database.query(soql);
-            return rows.isEmpty() ? null : (Id) rows[0].get('Id');
-        } catch (Exception e) {
-            System.debug(LoggingLevel.WARN, 'PW course lookup failed for name="' + courseName + '" using object ' + COURSE_OBJ_API + ': ' + e.getMessage());
-            return null;
+    // ===== Helper Methods =====
+    private static Datetime toDatetimeUtc(String iso) {
+        if (String.isBlank(iso)) return null;
+        try { 
+            return Datetime.valueOfGmt(iso.replace('T',' ').replace('Z','')); 
+        } catch (Exception e) { 
+            return null; 
         }
     }
-
-    public class FlowInput {
-        @InvocableVariable public Integer pageSize;
-        @InvocableVariable public String actionType;
+    
+    private static String asString(Object o) { 
+        return o == null ? null : String.valueOf(o); 
+    }
+    
+    private static Boolean asBool(Object o) { 
+        return o == null ? false : Boolean.valueOf(String.valueOf(o)); 
     }
 
+    // ===== Flow Input/Output Classes =====
+    public class FlowInput {
+        @InvocableVariable public Integer pageSize;
+        @InvocableVariable public String actionType; // new optional filter, e.g. 'create_group'
+    }
+    
     public class FlowOutput {
         @InvocableVariable public String jobId;
         @InvocableVariable public String message;
     }
 
-    @InvocableMethod(label='Run Apex to Sync Cohort Data from PW' description='Enqueues PWCohortSync with optional page size (default 25) and action type filter.')
+    // ===== Flow Entry Point =====
+    @InvocableMethod(label='Fetch cohort activity updates from PW' description='Enqueues PWCohortsFetchUpdates with optional filters (page size, actionType).')
     public static List<FlowOutput> runFromFlow(List<FlowInput> inputs) {
-        Integer first = 25;
-        String actionType;
+        Integer first = 50;
+        String actionTypeVar = null;
         if (inputs != null && !inputs.isEmpty() && inputs[0] != null) {
-            if (inputs[0].pageSize != null && inputs[0].pageSize > 0) first = inputs[0].pageSize;
-            actionType = inputs[0].actionType;
+            if (inputs[0].pageSize != null && inputs[0].pageSize > 0) {
+                first = inputs[0].pageSize;
+            }
+            if (String.isNotBlank(inputs[0].actionType)) {
+                actionTypeVar = inputs[0].actionType;
+            }
         }
-        FlowOutput out = new FlowOutput();
+
+        FlowOutput o = new FlowOutput();
         try {
-            out.jobId = (String) System.enqueueJob(new PWCohortSync(first, actionType));
-            out.message = 'Enqueued pageSize=' + first + (actionType == null ? '' : ' | actionType=' + actionType);
+            o.jobId = (String) System.enqueueJob(new PWCohortsFetchUpdates(first, actionTypeVar));
+            o.message = 'Enqueued PWCohortsFetchUpdates with pageSize=' + first +
+                        (String.isNotBlank(actionTypeVar) ? ', actionType=' + actionTypeVar : '');
         } catch (Exception e) {
-            out.message = 'Failed to enqueue: ' + e.getMessage();
+            o.message = 'Failed to enqueue PWCohortsFetchUpdates: ' + e.getMessage();
         }
-        return new List<FlowOutput>{ out };
+        return new List<FlowOutput>{ o };
     }
 }
