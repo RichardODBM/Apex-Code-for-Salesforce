@@ -1,0 +1,179 @@
+// File: PWUpsertRegistrations.cls (Annotated)
+// Purpose: Queueable Apex that calls Pathwright GraphQL to fetch registration data
+//          and upserts it into API_Test__c using External_ID__c as the
+//          external id. Only a subset of fields is mapped to the test object.
+
+public with sharing class PWUpsertRegistrations implements Queueable, Database.AllowsCallouts {
+    private Integer first;
+
+    public PWUpsertRegistrations(Integer first) { 
+        this.first = (first != null && first > 0) ? first : 25; 
+    }
+
+    public void execute(QueueableContext qc) {
+        try {
+            HttpRequest req = new HttpRequest();
+            req.setEndpoint('callout:Pathwright_GraphQL');
+            req.setMethod('POST');
+            req.setHeader('Content-Type', 'application/json');
+
+            // Full GraphQL query retained, but only a few fields mapped to Salesforce.
+            String q =
+            'query PageInfo($first: Int!) {' + '\n' +
+            '  activity(first: $first) {' + '\n' +
+            '    pageInfo {' + '\n' +
+            '      endCursor' + '\n' +
+            '      hasNextPage' + '\n' +
+            '    }' + '\n' +
+            '    edges {' + '\n' +
+            '      node {' + '\n' +
+            '        registration {' + '\n' +
+            '          id' + '\n' +
+            '          role' + '\n' +
+            '          created' + '\n' +
+            '          completion_state' + '\n' +
+            '          path_id' + '\n' +
+            '          group {' + '\n' +
+            '            id' + '\n' +
+            '            name' + '\n' +
+            '            price' + '\n' +
+            '          }' + '\n' +
+            '          user {' + '\n' +
+            '            first_name' + '\n' +
+            '            last_name' + '\n' +
+            '            email' + '\n' +
+            '            id' + '\n' +
+            '          }' + '\n' +
+            '        }' + '\n' +
+            '      }' + '\n' +
+            '    }' + '\n' +
+            '  }' + '\n' +
+            '}';
+
+            req.setBody(JSON.serialize(new Map<String,Object>{
+                'query' => q,
+                'variables' => new Map<String,Object>{ 'first' => first }
+            }));
+
+            HttpResponse res = new Http().send(req);
+            System.debug(LoggingLevel.INFO, 'HTTP ' + res.getStatusCode());
+
+            if (res.getStatusCode() != 200) { 
+                System.debug(res.getBody()); 
+                return; 
+            }
+
+            Map<String,Object> body = (Map<String,Object>) JSON.deserializeUntyped(res.getBody());
+            Map<String,Object> data = (Map<String,Object>) body.get('data');
+            Map<String,Object> act  = (data == null) ? null : (Map<String,Object>) data.get('activity');
+            List<Object> edges      = (act == null) ? new List<Object>() : (List<Object>) act.get('edges');
+            Map<String,Object> pi   = (act == null) ? null : (Map<String,Object>) act.get('pageInfo');
+
+            System.debug(LoggingLevel.INFO,
+                'Fetched ' + edges.size() +
+                ' rows | hasNext=' + String.valueOf(pi == null ? null : pi.get('hasNextPage')));
+
+            List<API_Test__c> rows = new List<API_Test__c>();
+
+            for (Object eo : edges) {
+                Map<String,Object> node = (Map<String,Object>) ((Map<String,Object>) eo).get('node');
+                if (node == null) continue;
+
+                Map<String,Object> reg = (Map<String,Object>) node.get('registration');
+                if (reg == null) continue;
+
+                Object regIdObj = reg.get('id');
+                if (regIdObj == null) continue;
+
+                API_Test__c r = new API_Test__c();
+                // Use registration id as external key and set Name for visibility
+                r.External_ID__c = String.valueOf(regIdObj);
+                r.Name = String.valueOf(regIdObj);
+                // Created → Date and Time 1
+                r.Date_and_Time_1__c = toDatetimeUtc(asString(reg.get('created')));
+
+                // User details
+                Map<String,Object> usr = (Map<String,Object>) reg.get('user');
+                if (usr != null) {
+                    // First name → Text 1
+                    r.Text_1__c = asString(usr.get('first_name'));
+                    // Email → Email
+                    r.Email__c  = asString(usr.get('email'));
+                }
+
+                // Group name → Text 2
+                Map<String,Object> grp = (Map<String,Object>) reg.get('group');
+                if (grp != null) {
+                    r.Text_2__c = asString(grp.get('name'));
+                }
+
+                // Mark checkbox as true
+                // r.Checkbox__c = true;
+
+                rows.add(r);
+            }
+
+            if (!rows.isEmpty()) {
+                Database.UpsertResult[] rs = Database.upsert(
+                    rows,
+                    Schema.SObjectType.API_Test__c.fields.getMap().get('External_ID__c'),
+                    false
+                );
+
+                Integer created = 0, updated = 0, failed = 0;
+                for (Database.UpsertResult ur : rs) {
+                    if (ur.isSuccess()) {
+                        if (ur.isCreated()) created++; else updated++;
+                    } else {
+                        failed++;
+                        for (Database.Error e : ur.getErrors()) {
+                            System.debug(LoggingLevel.ERROR, 'Upsert error: ' + e.getStatusCode() + ' ' + e.getMessage());
+                        }
+                    }
+                }
+                System.debug(LoggingLevel.INFO, 'Upsert summary: created=' + created + ', updated=' + updated + ', failed=' + failed);
+            }
+        } catch (Exception e) {
+            System.debug(LoggingLevel.ERROR, 'Callout failed: ' + e.getMessage());
+        }
+    }
+
+    private static Datetime toDatetimeUtc(String iso) {
+        if (String.isBlank(iso)) return null;
+        try { 
+            return Datetime.valueOfGmt(iso.replace('T',' ').replace('Z','')); 
+        } catch (Exception e) { 
+            return null; 
+        }
+    }
+
+    private static String asString(Object o) { return o == null ? null : String.valueOf(o); }
+    private static Boolean asBool(Object o) { return o == null ? false : Boolean.valueOf(String.valueOf(o)); }
+
+    public class FlowInput {
+        @InvocableVariable public Integer pageSize;
+    }
+
+    public class FlowOutput {
+        @InvocableVariable public String jobId;
+        @InvocableVariable public String message;
+    }
+
+    @InvocableMethod(label='Run Apex to Sync Registration Data from PW' description='Enqueues PWUpsertRegistrations with an optional page size (default 25).')
+    public static List<FlowOutput> runFromFlow(List<FlowInput> inputs) {
+        Integer first = 25;
+        if (inputs != null && !inputs.isEmpty() && inputs[0] != null
+            && inputs[0].pageSize != null && inputs[0].pageSize > 0) {
+            first = inputs[0].pageSize;
+        }
+
+        FlowOutput o = new FlowOutput();
+        try {
+            o.jobId = (String) System.enqueueJob(new PWUpsertRegistrations(first));
+            o.message = 'Enqueued with pageSize=' + first;
+        } catch (Exception e) {
+            o.message = 'Failed to enqueue: ' + e.getMessage();
+        }
+        return new List<FlowOutput>{ o };
+    }
+}
