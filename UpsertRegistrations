@@ -1,14 +1,26 @@
-// File: PWUpsertRegistrations.cls (Annotated)
+/ File: PWUpsertRegistrations.cls (With Full Pagination)
 // Purpose: Queueable Apex that calls Pathwright GraphQL to fetch registration data
 //          and upserts it into API_Test__c using External_ID__c as the
-//          external id. Only a subset of fields is mapped to the test object.
+//          external id. Now includes full pagination support to process all records.
 
 public with sharing class PWUpsertRegistrations implements Queueable, Database.AllowsCallouts {
     private Integer first;
+    private String cursor;
+    private Integer totalProcessed;
 
+    // Constructor for initial call (no cursor)
     public PWUpsertRegistrations(Integer first) { 
-        this.first = (first != null && first > 0) ? first : 25; 
-        System.debug(LoggingLevel.INFO, 'PWUpsertRegistrations constructor - received: ' + first + ', using: ' + this.first);
+        this(first, null, 0);
+    }
+
+    // Constructor for pagination (with cursor and running total)
+    public PWUpsertRegistrations(Integer first, String cursor, Integer totalProcessed) {
+        this.first = (first != null && first > 0) ? first : 25;
+        this.cursor = cursor;
+        this.totalProcessed = (totalProcessed != null) ? totalProcessed : 0;
+        System.debug(LoggingLevel.INFO, 'PWUpsertRegistrations constructor - pageSize: ' + this.first + 
+                     ', cursor: ' + (String.isBlank(cursor) ? 'null (first page)' : cursor) + 
+                     ', totalProcessed: ' + this.totalProcessed);
     }
 
     public void execute(QueueableContext qc) {
@@ -18,49 +30,25 @@ public with sharing class PWUpsertRegistrations implements Queueable, Database.A
             req.setMethod('POST');
             req.setHeader('Content-Type', 'application/json');
 
-            // Full GraphQL query retained, but only a few fields mapped to Salesforce.
-            String q =
-            'query PageInfo($first: Int!) {' + '\n' +
-            '  activity(first: $first) {' + '\n' +
-            '    pageInfo {' + '\n' +
-            '      endCursor' + '\n' +
-            '      hasNextPage' + '\n' +
-            '    }' + '\n' +
-            '    edges {' + '\n' +
-            '      node {' + '\n' +
-            '        registration {' + '\n' +
-            '          id' + '\n' +
-            '          role' + '\n' +
-            '          created' + '\n' +
-            '          completion_state' + '\n' +
-            '          path_id' + '\n' +
-            '          group {' + '\n' +
-            '            id' + '\n' +
-            '            name' + '\n' +
-            '            price' + '\n' +
-            '          }' + '\n' +
-            '          user {' + '\n' +
-            '            first_name' + '\n' +
-            '            last_name' + '\n' +
-            '            email' + '\n' +
-            '            id' + '\n' +
-            '          }' + '\n' +
-            '        }' + '\n' +
-            '      }' + '\n' +
-            '    }' + '\n' +
-            '  }' + '\n' +
-            '}';
+            // Enhanced GraphQL query with cursor support for pagination
+            String q = buildGraphQLQuery();
+
+            // Build variables map with cursor if provided
+            Map<String,Object> variables = new Map<String,Object>{ 'first' => first };
+            if (String.isNotBlank(cursor)) {
+                variables.put('after', cursor);
+            }
 
             req.setBody(JSON.serialize(new Map<String,Object>{
                 'query' => q,
-                'variables' => new Map<String,Object>{ 'first' => first }
+                'variables' => variables
             }));
 
             HttpResponse res = new Http().send(req);
             System.debug(LoggingLevel.INFO, 'HTTP ' + res.getStatusCode());
 
             if (res.getStatusCode() != 200) { 
-                System.debug(res.getBody()); 
+                System.debug(LoggingLevel.ERROR, 'HTTP Error: ' + res.getBody()); 
                 return; 
             }
 
@@ -70,10 +58,15 @@ public with sharing class PWUpsertRegistrations implements Queueable, Database.A
             List<Object> edges      = (act == null) ? new List<Object>() : (List<Object>) act.get('edges');
             Map<String,Object> pi   = (act == null) ? null : (Map<String,Object>) act.get('pageInfo');
 
+            Boolean hasNextPage = (pi != null) ? (Boolean) pi.get('hasNextPage') : false;
+            String endCursor = (pi != null) ? (String) pi.get('endCursor') : null;
+
             System.debug(LoggingLevel.INFO,
-                'Requested: ' + first + ' records | ' +
-                'Fetched ' + edges.size() +
-                ' rows | hasNext=' + String.valueOf(pi == null ? null : pi.get('hasNextPage')));
+                'Page Info - Requested: ' + first + ' records | ' +
+                'Fetched: ' + edges.size() + ' records | ' +
+                'HasNextPage: ' + hasNextPage + ' | ' +
+                'EndCursor: ' + endCursor + ' | ' +
+                'TotalProcessedSoFar: ' + totalProcessed);
 
             List<API_Test__c> rows = new List<API_Test__c>();
 
@@ -115,6 +108,7 @@ public with sharing class PWUpsertRegistrations implements Queueable, Database.A
                 rows.add(r);
             }
 
+            Integer currentBatchProcessed = 0;
             if (!rows.isEmpty()) {
                 Database.UpsertResult[] rs = Database.upsert(
                     rows,
@@ -125,6 +119,7 @@ public with sharing class PWUpsertRegistrations implements Queueable, Database.A
                 Integer created = 0, updated = 0, failed = 0;
                 for (Database.UpsertResult ur : rs) {
                     if (ur.isSuccess()) {
+                        currentBatchProcessed++;
                         if (ur.isCreated()) created++; else updated++;
                     } else {
                         failed++;
@@ -133,11 +128,60 @@ public with sharing class PWUpsertRegistrations implements Queueable, Database.A
                         }
                     }
                 }
-                System.debug(LoggingLevel.INFO, 'Upsert summary: created=' + created + ', updated=' + updated + ', failed=' + failed);
+                System.debug(LoggingLevel.INFO, 'Current batch upsert summary: created=' + created + 
+                             ', updated=' + updated + ', failed=' + failed + ', successful=' + currentBatchProcessed);
             }
+
+            Integer newTotalProcessed = totalProcessed + currentBatchProcessed;
+
+            // PAGINATION: Chain next job if there are more pages
+            if (hasNextPage && String.isNotBlank(endCursor)) {
+                System.debug(LoggingLevel.INFO, 'More pages available. Enqueueing next batch with cursor: ' + endCursor);
+                System.enqueueJob(new PWUpsertRegistrations(first, endCursor, newTotalProcessed));
+            } else {
+                System.debug(LoggingLevel.INFO, 'Pagination complete! Total records processed across all pages: ' + newTotalProcessed);
+            }
+
         } catch (Exception e) {
-            System.debug(LoggingLevel.ERROR, 'Callout failed: ' + e.getMessage());
+            System.debug(LoggingLevel.ERROR, 'Callout failed: ' + e.getMessage() + ' | Stack trace: ' + e.getStackTraceString());
         }
+    }
+
+    // Build GraphQL query with conditional cursor parameter
+    private String buildGraphQLQuery() {
+        String cursorParam = String.isNotBlank(cursor) ? ', $after: String' : '';
+        String cursorArg = String.isNotBlank(cursor) ? ', after: $after' : '';
+        
+        return 'query PageInfo($first: Int!' + cursorParam + ') {' + '\n' +
+               '  activity(first: $first' + cursorArg + ') {' + '\n' +
+               '    pageInfo {' + '\n' +
+               '      endCursor' + '\n' +
+               '      hasNextPage' + '\n' +
+               '    }' + '\n' +
+               '    edges {' + '\n' +
+               '      node {' + '\n' +
+               '        registration {' + '\n' +
+               '          id' + '\n' +
+               '          role' + '\n' +
+               '          created' + '\n' +
+               '          completion_state' + '\n' +
+               '          path_id' + '\n' +
+               '          group {' + '\n' +
+               '            id' + '\n' +
+               '            name' + '\n' +
+               '            price' + '\n' +
+               '          }' + '\n' +
+               '          user {' + '\n' +
+               '            first_name' + '\n' +
+               '            last_name' + '\n' +
+               '            email' + '\n' +
+               '            id' + '\n' +
+               '          }' + '\n' +
+               '        }' + '\n' +
+               '      }' + '\n' +
+               '    }' + '\n' +
+               '  }' + '\n' +
+               '}';
     }
 
     private static Datetime toDatetimeUtc(String iso) {
@@ -161,7 +205,7 @@ public with sharing class PWUpsertRegistrations implements Queueable, Database.A
         @InvocableVariable public String message;
     }
 
-    @InvocableMethod(label='Run Apex to Sync Registration Data from PW' description='Enqueues PWUpsertRegistrations with an optional page size (default 25).')
+    @InvocableMethod(label='Run Apex to Sync Registration Data from PW' description='Enqueues PWUpsertRegistrations with an optional page size (default 25). Will automatically paginate through all available records.')
     public static List<FlowOutput> runFromFlow(List<FlowInput> inputs) {
         Integer first = 25;
         if (inputs != null && !inputs.isEmpty() && inputs[0] != null
@@ -172,7 +216,7 @@ public with sharing class PWUpsertRegistrations implements Queueable, Database.A
         FlowOutput o = new FlowOutput();
         try {
             o.jobId = (String) System.enqueueJob(new PWUpsertRegistrations(first));
-            o.message = 'Enqueued with pageSize=' + first;
+            o.message = 'Enqueued with pageSize=' + first + '. Will automatically paginate through all records.';
         } catch (Exception e) {
             o.message = 'Failed to enqueue: ' + e.getMessage();
         }
