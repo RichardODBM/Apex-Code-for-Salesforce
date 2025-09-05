@@ -8,6 +8,7 @@ public with sharing class PWUpsertRegistrations implements Queueable, Database.A
 
     public PWUpsertRegistrations(Integer first) { 
         this.first = (first != null && first > 0) ? first : 25; 
+        System.debug(LoggingLevel.INFO, 'PWUpsertRegistrations constructor - received: ' + first + ', using: ' + this.first);
     }
 
     public void execute(QueueableContext qc) {
@@ -70,6 +71,7 @@ public with sharing class PWUpsertRegistrations implements Queueable, Database.A
             Map<String,Object> pi   = (act == null) ? null : (Map<String,Object>) act.get('pageInfo');
 
             System.debug(LoggingLevel.INFO,
+                'Requested: ' + first + ' records | ' +
                 'Fetched ' + edges.size() +
                 ' rows | hasNext=' + String.valueOf(pi == null ? null : pi.get('hasNextPage')));
 
